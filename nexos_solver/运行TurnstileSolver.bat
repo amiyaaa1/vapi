@@ -1,0 +1,1 @@
+python api_solver.py --browser_type chromium --thread 5 --debug

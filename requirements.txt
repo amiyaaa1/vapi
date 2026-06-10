@@ -1,0 +1,4 @@
+playwright==1.57.0
+httpx
+python-dotenv
+curl_cffi

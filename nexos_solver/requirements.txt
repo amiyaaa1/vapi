@@ -1,0 +1,4 @@
+quart
+patchright
+rich
+aiosqlite

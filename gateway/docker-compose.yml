@@ -1,0 +1,18 @@
+services:
+  vapi-gateway:
+    build: .
+    container_name: vapi-gateway
+    environment:
+      - SOCKS5_PROXY=${SOCKS5_PROXY:-}         # 可选，socks5 代理地址，如 127.0.0.1:1080
+      - KEYS_PATH=/data/keys.txt
+      # - LISTEN_ADDR=:8080                    # 可选，默认 :8080
+      # - CURL_CFFI_IMPERSONATE=chrome131      # 可选，TLS 指纹
+    volumes:
+      - ./data:/data
+    networks:
+      - 1panel-network
+    restart: unless-stopped
+
+networks:
+  1panel-network:
+    external: true

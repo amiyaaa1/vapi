@@ -1,0 +1,4 @@
+# 每行一个 Vapi private_key，网关启动时自动加载
+# 示例：
+# xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+# yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy

@@ -1,0 +1,12 @@
+.git
+.agents
+accounts
+data
+__pycache__
+*.pyc
+*.pyo
+*.tar
+*.tar.gz
+*.zip
+browser-bind-debug
+
