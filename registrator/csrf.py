@@ -5,9 +5,10 @@ import os
 import random
 import re
 import socket
+import subprocess
 import time
 from typing import Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 from playwright.async_api import async_playwright
@@ -32,6 +33,8 @@ TURNSTILE_SOLVER_ATTEMPTS = int(os.getenv("TURNSTILE_SOLVER_ATTEMPTS", os.getenv
 WARP_CONTAINER_NAME = os.getenv("WARP_CONTAINER_NAME", "vapi-gateway-warp")
 WARP_RESTART_COOLDOWN_SECONDS = float(os.getenv("WARP_RESTART_COOLDOWN_SECONDS", "75"))
 WARP_RESTART_WAIT_SECONDS = float(os.getenv("WARP_RESTART_WAIT_SECONDS", "12"))
+WARP_RESTART_BILLING_COOLDOWN_SECONDS = float(os.getenv("WARP_RESTART_BILLING_COOLDOWN_SECONDS", os.getenv("WARP_RESTART_COOLDOWN_SECONDS", "75")))
+WARP_RESTART_BILLING_WAIT_SECONDS = float(os.getenv("WARP_RESTART_BILLING_WAIT_SECONDS", os.getenv("WARP_RESTART_WAIT_SECONDS", "12")))
 WARP_RESTART_STATE_FILE = os.getenv("WARP_RESTART_STATE_FILE", "/data/warp-restart-last")
 
 
@@ -40,6 +43,34 @@ def _env_true(name: str, default: bool = False) -> bool:
     if value is None or value == "":
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+_DIRECT_PROXY_VALUES = {"", "0", "none", "no", "off", "direct", "direct://"}
+
+
+def _is_direct_proxy_value(value: str) -> bool:
+    return str(value or "").strip().lower() in _DIRECT_PROXY_VALUES
+
+
+def _turnstile_solver_proxy(proxy_url: str = "") -> str:
+    """Return the proxy for Turnstile/Cloak solver tasks.
+
+    The direct path currently stalls on Turnstile in this sandbox.  Keep solver
+    traffic on WARP by default even when the outer registration proxy is empty
+    or explicitly `direct`; set TURNSTILE_SOLVER_FORCE_PROXY=0 to disable this.
+    """
+    requested = str(proxy_url or "").strip()
+    if requested and not _is_direct_proxy_value(requested):
+        return requested
+
+    if requested and _is_direct_proxy_value(requested) and not _env_true("TURNSTILE_SOLVER_FORCE_PROXY", True):
+        return ""
+
+    for name in ("TURNSTILE_SOLVER_PROXY", "WARP_PROXY_URL", "SOCKS5_PROXY", "BILLING_BIND_PROXY"):
+        value = str(os.getenv(name) or "").strip()
+        if value and not _is_direct_proxy_value(value):
+            return value
+    return ""
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):
@@ -64,6 +95,96 @@ def _docker_post(path: str) -> tuple[int, str]:
         return response.status, body
     finally:
         conn.close()
+
+
+async def _wait_for_warp_proxy_ready(timeout: float, reason: str = "") -> bool:
+    if timeout <= 0:
+        return True
+    deadline = time.time() + timeout
+    proxy_url = os.getenv("WARP_HEALTH_PROXY_URL") or os.getenv("WARP_PROXY_URL") or os.getenv("SOCKS5_PROXY")
+    if not proxy_url:
+        billing_proxy = (os.getenv("BILLING_BIND_PROXY") or "").strip()
+        if billing_proxy.lower() not in ("0", "none", "no", "off", "direct", "direct://"):
+            proxy_url = billing_proxy
+    if not proxy_url:
+        proxy_url = f"socks5://{WARP_CONTAINER_NAME}:1080" if WARP_CONTAINER_NAME else ""
+    if not proxy_url:
+        await asyncio.sleep(timeout)
+        return True
+
+    require_warp_on = _env_true("WARP_HEALTH_REQUIRE_WARP_ON", True)
+    allow_tcp_fallback = _env_true("WARP_HEALTH_TCP_FALLBACK", False)
+    last_error = ""
+    while time.time() < deadline:
+        try:
+            trace = await asyncio.to_thread(_warp_trace_sync, proxy_url)
+            if trace.get("ok"):
+                warp_state = str(trace.get("warp") or "").lower()
+                if not require_warp_on or warp_state == "on":
+                    log.warning(
+                        "WARP proxy ready after restart: "
+                        f"proxy={proxy_url} ip={trace.get('ip','')} colo={trace.get('colo','')} warp={trace.get('warp','')} "
+                        f"reason={reason[:120]}"
+                    )
+                    return True
+                last_error = f"trace warp={warp_state or 'missing'} ip={trace.get('ip','')}"
+            else:
+                last_error = str(trace.get("error") or trace)
+        except Exception as e:
+            last_error = str(e)
+        if allow_tcp_fallback:
+            try:
+                parsed = urlsplit(proxy_url)
+                host = parsed.hostname
+                port = parsed.port or (1080 if (parsed.scheme or "").startswith("socks") else 80)
+                if host and port:
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=3.0)
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                    log.warning(f"WARP proxy TCP ready after restart: proxy={proxy_url} reason={reason[:120]}")
+                    return True
+            except Exception as e:
+                last_error = str(e)
+        await asyncio.sleep(1.0)
+    log.warning(f"WARP proxy readiness wait timed out after {timeout}s: proxy={proxy_url} last={last_error[:180]} reason={reason[:120]}")
+    return False
+
+
+def _warp_trace_sync(proxy_url: str = "") -> dict:
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        return {"ok": False, "error": "empty proxy"}
+    trace_url = os.getenv("WARP_HEALTHCHECK_URL", "https://cloudflare.com/cdn-cgi/trace")
+    timeout = str(max(2, int(float(os.getenv("WARP_HEALTH_CURL_TIMEOUT", "8")))))
+    connect_timeout = str(max(1, int(float(os.getenv("WARP_HEALTH_CURL_CONNECT_TIMEOUT", "4")))))
+    args = ["curl", "-fsS", "--max-time", timeout, "--connect-timeout", connect_timeout]
+    try:
+        parsed = urlsplit(proxy_url)
+        if (parsed.scheme or "").startswith("socks"):
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 1080
+            args += ["--socks5-hostname", f"{host}:{port}"]
+        else:
+            args += ["--proxy", proxy_url]
+    except Exception:
+        args += ["--proxy", proxy_url]
+    args.append(trace_url)
+    try:
+        proc = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=float(timeout) + 2)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if proc.returncode != 0:
+        return {"ok": False, "error": (proc.stderr or proc.stdout or f"curl exit {proc.returncode}")[:300]}
+    data = {}
+    for line in (proc.stdout or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key.strip()] = value.strip()
+    data["ok"] = bool(data.get("ip") or data.get("warp"))
+    return data
 
 
 def _warp_restartable_solver_error(error: str) -> bool:
@@ -129,10 +250,101 @@ async def _restart_warp_after_solver_issue(reason: str) -> bool:
     try:
         restarted = await asyncio.to_thread(_restart_warp_container_sync, reason)
         if restarted and WARP_RESTART_WAIT_SECONDS > 0:
-            await asyncio.sleep(WARP_RESTART_WAIT_SECONDS)
+            await _wait_for_warp_proxy_ready(WARP_RESTART_WAIT_SECONDS, reason)
         return restarted
     except Exception as e:
         log.warning(f"WARP restart failed after Turnstile solver issue: {e}")
+        return False
+
+
+def _restart_warp_container_for_billing_sync(reason: str) -> bool:
+    if not _env_true("WARP_RESTART_ON_BILLING_DECLINE", True):
+        return False
+    if not WARP_CONTAINER_NAME:
+        log.warning("WARP restart skipped for billing: WARP_CONTAINER_NAME is empty")
+        return False
+    docker_socket = os.getenv("DOCKER_SOCKET", "/var/run/docker.sock")
+    if not os.path.exists(docker_socket):
+        log.warning(f"WARP restart skipped for billing: docker socket not found: {docker_socket}")
+        return False
+
+    now = time.time()
+    try:
+        with open(WARP_RESTART_STATE_FILE, "r", encoding="utf-8") as file:
+            last = float((file.read() or "0").strip() or "0")
+    except Exception:
+        last = 0
+    if last and now - last < WARP_RESTART_BILLING_COOLDOWN_SECONDS:
+        log.warning(
+            f"WARP billing restart skipped by cooldown: reason={reason} "
+            f"remaining={int(WARP_RESTART_BILLING_COOLDOWN_SECONDS - (now - last))}s"
+        )
+        return False
+
+    path = f"/containers/{quote(WARP_CONTAINER_NAME, safe='')}/restart?t=5"
+    status, body = _docker_post(path)
+    if status not in (200, 204):
+        raise RuntimeError(f"Docker restart {WARP_CONTAINER_NAME} failed: status={status} body={body[:200]}")
+
+    try:
+        os.makedirs(os.path.dirname(WARP_RESTART_STATE_FILE), exist_ok=True)
+        with open(WARP_RESTART_STATE_FILE, "w", encoding="utf-8") as file:
+            file.write(str(now))
+    except Exception:
+        pass
+
+    log.warning(f"WARP restarted for billing attach decline: container={WARP_CONTAINER_NAME} reason={reason}")
+    return True
+
+
+async def _restart_warp_after_billing_issue(reason: str) -> bool:
+    try:
+        restarted = await asyncio.to_thread(_restart_warp_container_for_billing_sync, reason)
+        if restarted and WARP_RESTART_BILLING_WAIT_SECONDS > 0:
+            await _wait_for_warp_proxy_ready(WARP_RESTART_BILLING_WAIT_SECONDS, reason)
+        return restarted
+    except Exception as e:
+        log.warning(f"WARP restart failed after billing attach decline: {e}")
+        return False
+
+
+async def _recycle_turnstile_solver_pool(reason: str) -> bool:
+    """Force the in-process Turnstile solver to launch a fresh browser pool.
+
+    WARP restart changes the network exit, but the solver's `--random` browser
+    fingerprint is selected when a browser is launched. With a single long-lived
+    solver browser, retrying after only a WARP restart can keep the same UA /
+    Sec-CH-UA. Recycling makes the next retry use a newly launched random
+    browser config.
+    """
+    if not _env_true("TURNSTILE_SOLVER_RECYCLE_ON_WARP_RESTART", True):
+        return False
+    if not TURNSTILE_SOLVER_URL:
+        return False
+
+    try:
+        timeout = httpx.Timeout(25.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{TURNSTILE_SOLVER_URL}/pool/recycle",
+                json={"reason": str(reason or "")[:220]},
+            )
+            data = response.json()
+        if response.status_code >= 400 or not data.get("ok"):
+            log.warning(
+                f"Turnstile solver pool recycle failed: "
+                f"status={response.status_code} body={str(data)[:300]}"
+            )
+            return False
+        log.warning(
+            "Turnstile solver browser pool recycled: "
+            f"target={data.get('target')} idle={data.get('idle')} "
+            f"retiring={data.get('retiring')} generation={data.get('generation')} "
+            f"reason={str(reason or '')[:160]}"
+        )
+        return True
+    except Exception as e:
+        log.warning(f"Turnstile solver pool recycle failed: {e}")
         return False
 
 
@@ -166,8 +378,9 @@ async def _get_token_from_nexos_solver(proxy_url: str = "", page_url: str = REGI
 
     timeout = httpx.Timeout(30.0, connect=5.0)
     params = {"url": page_url, "sitekey": SITEKEY}
-    if proxy_url:
-        params["proxy"] = proxy_url
+    solver_proxy = _turnstile_solver_proxy(proxy_url)
+    if solver_proxy:
+        params["proxy"] = solver_proxy
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         task_id = ""
@@ -278,8 +491,13 @@ async def get_turnstile_token(proxy_url: str = "", page_url: str = REGISTER_URL)
             error_text = f"{type(e).__name__}: {e}"
             if attempt < attempts and _warp_restartable_solver_error(error_text):
                 restarted = await _restart_warp_after_solver_issue(error_text[:180])
-                if restarted:
-                    log.warning(f"Retrying Turnstile solver after WARP restart: attempt={attempt + 1}/{attempts}")
+                recycled = await _recycle_turnstile_solver_pool(error_text[:180])
+                if restarted or recycled:
+                    log.warning(
+                        f"Retrying Turnstile solver after recovery: "
+                        f"warpRestarted={restarted} poolRecycled={recycled} "
+                        f"attempt={attempt + 1}/{attempts}"
+                    )
                     continue
             break
 
@@ -299,7 +517,8 @@ async def get_turnstile_token(proxy_url: str = "", page_url: str = REGISTER_URL)
             "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
         ]
-        proxy = {"server": proxy_url} if proxy_url else None
+        solver_proxy = _turnstile_solver_proxy(proxy_url)
+        proxy = {"server": solver_proxy} if solver_proxy else None
         browser = await playwright.chromium.launch(
             headless=True,
             executable_path=config.CHROME_PATH or None,

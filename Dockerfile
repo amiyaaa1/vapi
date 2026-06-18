@@ -19,10 +19,13 @@ WORKDIR /app
 COPY --from=build /out/gateway /app/gateway
 COPY requirements.txt /app/requirements.txt
 COPY nexos_solver/requirements.txt /app/nexos_solver/requirements.txt
+COPY vendor/CloakBrowser /tmp/CloakBrowser
 
 RUN pip install --no-cache-dir -r /app/requirements.txt \
   && pip install --no-cache-dir -r /app/nexos_solver/requirements.txt \
+  && pip install --no-cache-dir /tmp/CloakBrowser \
   && python3 -m patchright install chromium \
+  && python3 -c "from cloakbrowser import ensure_binary; print('CloakBrowser binary:', ensure_binary())" \
   && mkdir -p /data
 
 COPY gateway/scripts /app/scripts

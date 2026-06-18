@@ -1,0 +1,115 @@
+services:
+  vapi-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vapi-gateway-release:latest
+    restart: unless-stopped
+    init: true
+    environment:
+      LISTEN_ADDR: ":3100"
+      KEYS_PATH: /data/keys.txt
+      CONSUMED_KEYS_PATH: /data/keys.consumed.txt
+      FAILED_KEYS_PATH: /data/keys.failed.txt
+      CONFIG_PATH: /data/config.json
+      SOCKS5_PROXY: ${SOCKS5_PROXY:-socks5://warp:1080}
+      CURL_CFFI_IMPERSONATE: ${CURL_CFFI_IMPERSONATE:-chrome131}
+      VAPI_CHAT_HELPER: /app/scripts/vapi_chat.py
+      VAPI_CHAT_HELPER_DAEMON_ENABLED: ${VAPI_CHAT_HELPER_DAEMON_ENABLED:-1}
+      VAPI_CHAT_HELPER_HOST: ${VAPI_CHAT_HELPER_HOST:-127.0.0.1}
+      VAPI_CHAT_HELPER_PORT: ${VAPI_CHAT_HELPER_PORT:-8099}
+      VAPI_CHAT_HELPER_URL: ${VAPI_CHAT_HELPER_URL:-}
+      VAPI_CHAT_HELPER_FALLBACK: ${VAPI_CHAT_HELPER_FALLBACK:-1}
+      VAPI_CHAT_HELPER_IDLE_SESSIONS: ${VAPI_CHAT_HELPER_IDLE_SESSIONS:-128}
+      VAPI_CHAT_HELPER_MAX_BODY_BYTES: ${VAPI_CHAT_HELPER_MAX_BODY_BYTES:-52428800}
+      VAPI_CHAT_HELPER_BACKLOG: ${VAPI_CHAT_HELPER_BACKLOG:-1024}
+      VAPI_CHAT_HELPER_STARTUP_WAIT_SECONDS: ${VAPI_CHAT_HELPER_STARTUP_WAIT_SECONDS:-10}
+      TURNSTILE_SOLVER_URL: ${TURNSTILE_SOLVER_URL:-http://127.0.0.1:5000}
+      TURNSTILE_SOLVER_ATTEMPTS: ${TURNSTILE_SOLVER_ATTEMPTS:-2}
+      TURNSTILE_SOLVER_THREADS: ${TURNSTILE_SOLVER_THREADS:-1}
+      TURNSTILE_SOLVER_RANDOM: ${TURNSTILE_SOLVER_RANDOM:-1}
+      TURNSTILE_SOLVER_RECYCLE_ON_WARP_RESTART: ${TURNSTILE_SOLVER_RECYCLE_ON_WARP_RESTART:-1}
+      TURNSTILE_SOLVER_MAX_TASKS_PER_BROWSER: ${TURNSTILE_SOLVER_MAX_TASKS_PER_BROWSER:-5}
+      TURNSTILE_SOLVER_CLOSE_TIMEOUT: ${TURNSTILE_SOLVER_CLOSE_TIMEOUT:-12}
+      TURNSTILE_SOLVER_TMP_CLEANUP_MAX_AGE_SECONDS: ${TURNSTILE_SOLVER_TMP_CLEANUP_MAX_AGE_SECONDS:-21600}
+      TURNSTILE_SOLVER_DEBUG: ${TURNSTILE_SOLVER_DEBUG:-0}
+      TURNSTILE_SOLVER_CAPTURE: ${TURNSTILE_SOLVER_CAPTURE:-0}
+      TURNSTILE_SOLVER_TASK_TIMEOUT: ${TURNSTILE_SOLVER_TASK_TIMEOUT:-90}
+      ORG_DASHBOARD_ATTEMPTS: ${ORG_DASHBOARD_ATTEMPTS:-8}
+      ORG_DASHBOARD_RETRY_SECONDS: ${ORG_DASHBOARD_RETRY_SECONDS:-2}
+      WARP_CONTAINER_NAME: ${WARP_CONTAINER_NAME:-vapi-gateway-warp}
+      WARP_RESTART_ON_TURNSTILE_TIMEOUT: ${WARP_RESTART_ON_TURNSTILE_TIMEOUT:-1}
+      WARP_RESTART_COOLDOWN_SECONDS: ${WARP_RESTART_COOLDOWN_SECONDS:-75}
+      WARP_RESTART_WAIT_SECONDS: ${WARP_RESTART_WAIT_SECONDS:-12}
+      STRIPE_SOLVER_URL: ${STRIPE_SOLVER_URL:-http://127.0.0.1:5000}
+      STRIPE_SOLVER_TIMEOUT: ${STRIPE_SOLVER_TIMEOUT:-120}
+      SIGNUP_MODE: ${SIGNUP_MODE:-browser-fetch}
+      SIGNUP_SOLVER_BROWSER: ${SIGNUP_SOLVER_BROWSER:-1}
+      SIGNUP_SOLVER_BROWSER_FALLBACK: ${SIGNUP_SOLVER_BROWSER_FALLBACK:-1}
+      SIGNUP_SOLVER_BROWSER_ATTEMPTS: ${SIGNUP_SOLVER_BROWSER_ATTEMPTS:-2}
+      BILLING_BIND_MODE: ${BILLING_BIND_MODE:-protocol}
+      BILLING_ATTACH_MODE: ${BILLING_ATTACH_MODE:-browser-fetch}
+      BILLING_BROWSER_FALLBACK_ON_DECLINE: ${BILLING_BROWSER_FALLBACK_ON_DECLINE:-1}
+      STRIPE_PAYMENT_METHOD_MODE: ${STRIPE_PAYMENT_METHOD_MODE:-browser}
+      STRIPE_BROWSER_FINGERPRINT: ${STRIPE_BROWSER_FINGERPRINT:-0}
+      STRIPE_ELEMENTS_EVENT_GRACE_MS: ${STRIPE_ELEMENTS_EVENT_GRACE_MS:-8000}
+      STRIPE_ELEMENTS_INPUT_TIMEOUT_MS: ${STRIPE_ELEMENTS_INPUT_TIMEOUT_MS:-90000}
+      STRIPE_CREATE_PM_TIMEOUT_MS: ${STRIPE_CREATE_PM_TIMEOUT_MS:-60000}
+      BILLING_BROWSER_ENGINE: ${BILLING_BROWSER_ENGINE:-playwright}
+      BILLING_BROWSER_HEADLESS: ${BILLING_BROWSER_HEADLESS:-1}
+      BILLING_ENABLE_WEBGL: ${BILLING_ENABLE_WEBGL:-1}
+      BILLING_BIND_PROXY: ${BILLING_BIND_PROXY:-socks5://warp:1080}
+      STREAM_CONTINUATION_ENABLED: ${STREAM_CONTINUATION_ENABLED:-false}
+      TOOL_INPUT_MAX_RESULTS: ${TOOL_INPUT_MAX_RESULTS:-0}
+      REQUEST_BODY_LOG_ENABLED: ${REQUEST_BODY_LOG_ENABLED:-false}
+      REQUEST_BODY_LOG_MAX_BYTES: ${REQUEST_BODY_LOG_MAX_BYTES:-200000}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SERVER_API_KEY: ${SERVER_API_KEY:-}
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${HOST_PORT:-3100}:3100"
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      warp:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3100/healthz', timeout=5).read()"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  warp:
+    image: caomingjun/warp:latest
+    container_name: ${WARP_CONTAINER_NAME:-vapi-gateway-warp}
+    restart: always
+    device_cgroup_rules:
+      - "c 10:200 rwm"
+    environment:
+      WARP_SLEEP: ${WARP_SLEEP:-2}
+      WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+    cap_add:
+      - MKNOD
+      - AUDIT_WRITE
+      - NET_ADMIN
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--socks5-hostname", "127.0.0.1:1080", "https://cloudflare.com/cdn-cgi/trace"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  warp-data:

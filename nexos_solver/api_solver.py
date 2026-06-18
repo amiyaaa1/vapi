@@ -6,6 +6,10 @@ import random
 import logging
 import asyncio
 import re
+import signal
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Optional, Union
 import argparse
 from quart import Quart, request, jsonify
@@ -84,9 +88,27 @@ class TurnstileAPIServer:
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
         self.browser_slots = {}
+        self.browser_use_counts = {}
+        self.browser_root_pids = {}
+        self.browser_profile_dirs = {}
         self.retire_browsers = set()
         self.pool_lock = asyncio.Lock()
         self.next_browser_index = 1
+        self.pool_generation = 1
+        try:
+            self.max_tasks_per_browser = int(os.getenv("TURNSTILE_SOLVER_MAX_TASKS_PER_BROWSER", "5"))
+        except Exception:
+            self.max_tasks_per_browser = 5
+        if self.max_tasks_per_browser < 0:
+            self.max_tasks_per_browser = 0
+        try:
+            self.close_timeout = float(os.getenv("TURNSTILE_SOLVER_CLOSE_TIMEOUT", "12"))
+        except Exception:
+            self.close_timeout = 12.0
+        try:
+            self.tmp_cleanup_max_age = float(os.getenv("TURNSTILE_SOLVER_TMP_CLEANUP_MAX_AGE_SECONDS", "21600"))
+        except Exception:
+            self.tmp_cleanup_max_age = 21600.0
         self.playwright = None
         self.camoufox = None
         self.use_random_config = use_random_config
@@ -100,7 +122,7 @@ class TurnstileAPIServer:
         self.sec_ch_ua = None
         
         
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
+        if self.browser_type in ['chromium', 'chrome', 'msedge', 'cloak', 'cloakbrowser']:
             if browser_name and browser_version:
                 config = browser_config.get_browser_config(browser_name, browser_version)
                 if config:
@@ -162,6 +184,7 @@ class TurnstileAPIServer:
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/pool/status', methods=['GET'])(self.pool_status)
         self.app.route('/pool/resize', methods=['GET', 'POST'])(self.resize_pool_route)
+        self.app.route('/pool/recycle', methods=['GET', 'POST'])(self.recycle_pool_route)
         self.app.route('/')(self.index)
         
 
@@ -172,6 +195,7 @@ class TurnstileAPIServer:
         try:
             await init_db()
             await self._initialize_browser()
+            asyncio.create_task(asyncio.to_thread(self._cleanup_stale_temp_artifacts_sync, "startup"))
             
             # Запускаем периодическую очистку старых результатов
             asyncio.create_task(self._periodic_cleanup())
@@ -182,7 +206,7 @@ class TurnstileAPIServer:
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
+        if self.browser_type in ['chromium', 'chrome', 'msedge', 'cloak', 'cloakbrowser']:
             self.playwright = await async_playwright().start()
         elif self.browser_type == "camoufox":
             self.camoufox = AsyncCamoufox(headless=self.headless)
@@ -192,6 +216,10 @@ class TurnstileAPIServer:
                 await self._add_browser_to_pool_locked()
 
         logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+        if self.max_tasks_per_browser > 0:
+            logger.info(f"Browser auto recycle enabled: maxTasksPerBrowser={self.max_tasks_per_browser}")
+        else:
+            logger.info("Browser auto recycle by task count disabled")
         
         if self.use_random_config:
             logger.info(f"Each browser in pool received random configuration")
@@ -207,7 +235,7 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index} Sec-CH-UA: {config['sec_ch_ua']}")
 
     def _build_browser_config(self):
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
+        if self.browser_type in ['chromium', 'chrome', 'msedge', 'cloak', 'cloakbrowser']:
             if self.use_random_config:
                 browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
             elif self.browser_name and self.browser_version:
@@ -236,7 +264,28 @@ class TurnstileAPIServer:
             'sec_ch_ua': sec_ch_ua
         }
 
-    def _build_browser_args(self, config):
+    def _build_browser_args(self, config, launch_proxy: Optional[str] = None):
+        if self.browser_type in ("cloak", "cloakbrowser"):
+            extra_args = [
+                "--disable-dev-shm-usage",
+                "--renderer-process-limit=1",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ]
+            if self._cloak_proxy_launch_arg_enabled():
+                proxy_for_arg = launch_proxy or os.getenv("TURNSTILE_SOLVER_PROXY", "") or os.getenv("WARP_PROXY_URL", "") or os.getenv("SOCKS5_PROXY", "")
+                extra_args.extend(self._proxy_launch_arg(proxy_for_arg))
+            if os.getenv("TURNSTILE_CLOAK_WEBRTC_IP_AUTO", "1").strip().lower() not in ("0", "false", "no", "off"):
+                extra_args.append("--fingerprint-webrtc-ip=auto")
+            if config.get('useragent') and os.getenv("TURNSTILE_CLOAK_OVERRIDE_UA", "0").strip().lower() in ("1", "true", "yes", "on"):
+                extra_args.append(f"--user-agent={config['useragent']}")
+            try:
+                from cloakbrowser import build_args  # type: ignore
+                return build_args(True, extra_args, timezone=os.getenv("BILLING_TIMEZONE_ID", "Europe/Berlin"), locale="en-US", headless=self.headless)
+            except Exception as e:
+                if self._cloak_strict_enabled():
+                    raise RuntimeError(f"CloakBrowser build_args unavailable: {e}") from e
+                logger.warning(f"CloakBrowser build_args unavailable, using compatibility args: {e}")
+
         browser_args = [
             "--window-position=0,0",
             "--force-device-scale-factor=1",
@@ -280,6 +329,193 @@ class TurnstileAPIServer:
             browser_args.append(f"--user-agent={config['useragent']}")
         return browser_args
 
+    def _process_snapshot(self):
+        try:
+            output = subprocess.check_output(
+                ["ps", "-eo", "pid=,ppid=,args="],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return {}, {}
+
+        parents = {}
+        args_by_pid = {}
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+            except Exception:
+                continue
+            parents[pid] = ppid
+            args_by_pid[pid] = parts[2]
+        return parents, args_by_pid
+
+    def _is_own_descendant(self, pid: int, parents: dict[int, int]) -> bool:
+        own_pid = os.getpid()
+        seen = set()
+        while pid and pid not in seen:
+            if pid == own_pid:
+                return True
+            seen.add(pid)
+            pid = parents.get(pid, 0)
+        return False
+
+    def _chrome_root_processes(self) -> dict[int, str]:
+        parents, args_by_pid = self._process_snapshot()
+        roots = {}
+        for pid, args in args_by_pid.items():
+            if not self._is_own_descendant(pid, parents):
+                continue
+            if "chrome" not in args.lower():
+                continue
+            if "--type=" in args:
+                continue
+            if "--remote-debugging-pipe" not in args:
+                continue
+            roots[pid] = args
+        return roots
+
+    def _profile_dirs_from_args(self, args_list) -> set[str]:
+        dirs = set()
+        for args in args_list:
+            match = re.search(r"--user-data-dir=([^\s]+)", args or "")
+            if match:
+                dirs.add(match.group(1))
+        return dirs
+
+    def _pid_alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception:
+            return True
+
+    def _kill_tracked_browser_processes_sync(self, index: int, label: str = "") -> None:
+        pids = list(self.browser_root_pids.pop(index, set()) or [])
+        profile_dirs = set(self.browser_profile_dirs.pop(index, set()) or [])
+        alive = [pid for pid in pids if self._pid_alive(pid)]
+        if alive:
+            logger.warning(f"{label}: browser root still alive after close, terminating pids={alive}")
+            for pid in alive:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
+            deadline = time.time() + 3
+            while time.time() < deadline and any(self._pid_alive(pid) for pid in alive):
+                time.sleep(0.1)
+            for pid in alive:
+                if self._pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+
+        active_args = "\n".join(self._chrome_root_processes().values())
+        for profile_dir in profile_dirs:
+            try:
+                if profile_dir and profile_dir.startswith("/tmp/") and profile_dir not in active_args:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+            except Exception as e:
+                logger.debug(f"{label}: profile cleanup failed {profile_dir}: {e}")
+
+    async def _cleanup_await(self, awaitable, label: str, timeout: Optional[float] = None) -> bool:
+        timeout = self.close_timeout if timeout is None else timeout
+        task = asyncio.create_task(awaitable)
+        cancelled = False
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.CancelledError:
+            cancelled = True
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"{label} cleanup after cancellation timed out after {timeout}s")
+                task.cancel()
+            except Exception as e:
+                logger.warning(f"{label} cleanup after cancellation failed: {type(e).__name__}: {e}")
+        except asyncio.TimeoutError:
+            logger.warning(f"{label} cleanup timed out after {timeout}s")
+            task.cancel()
+        except Exception as e:
+            logger.warning(f"{label} cleanup failed: {type(e).__name__}: {e}")
+        return cancelled
+
+    async def _close_context_safely(self, context, label: str) -> bool:
+        if not context:
+            return False
+        return await self._cleanup_await(context.close(), label)
+
+    async def _close_browser_safely(self, browser, index: Optional[int] = None, label: str = "browser") -> bool:
+        cancelled = False
+        if browser:
+            cancelled = await self._cleanup_await(browser.close(), label, timeout=max(self.close_timeout, 15.0))
+        if index is not None:
+            cleanup_cancelled = await self._cleanup_await(
+                asyncio.to_thread(self._kill_tracked_browser_processes_sync, index, label),
+                f"{label} process cleanup",
+                timeout=8.0,
+            )
+            cancelled = cancelled or cleanup_cancelled
+        return cancelled
+
+    async def _finish_browser_task(self, index: int, browser, browser_config, context, label: str) -> None:
+        cancelled = False
+        if context:
+            cancelled = await self._close_context_safely(context, f"{label} context") or cancelled
+        cancelled = await self._cleanup_await(
+            self._return_browser_to_pool(index, browser, browser_config),
+            f"{label} return browser",
+            timeout=max(self.close_timeout, 20.0),
+        ) or cancelled
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    def _cleanup_stale_temp_artifacts_sync(self, reason: str = "") -> int:
+        if self.tmp_cleanup_max_age <= 0:
+            return 0
+        now = time.time()
+        _, all_args = self._process_snapshot()
+        active_args = "\n".join(all_args.values())
+        patterns = (
+            "playwright_chromiumdev_profile-",
+            "playwright-artifacts-",
+            "xvfb-run.",
+        )
+        removed = 0
+        try:
+            entries = list(os.scandir("/tmp"))
+        except Exception:
+            return 0
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if not any(name.startswith(prefix) for prefix in patterns):
+                    continue
+                path = entry.path
+                if path in active_args:
+                    continue
+                if now - entry.stat(follow_symlinks=False).st_mtime < self.tmp_cleanup_max_age:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+            except Exception:
+                continue
+        if removed:
+            logger.info(f"Cleaned stale browser temp artifacts: count={removed} reason={reason}")
+        return removed
+
     async def _launch_browser(self, config):
         if self.browser_type in ['chromium', 'chrome', 'msedge'] and self.playwright:
             return await self.playwright.chromium.launch(
@@ -287,19 +523,97 @@ class TurnstileAPIServer:
                 headless=self.headless,
                 args=self._build_browser_args(config)
             )
+        if self.browser_type in ("cloak", "cloakbrowser") and self.playwright:
+            executable = self._cloak_browser_executable_path()
+            if self._cloak_strict_enabled() and not executable:
+                raise RuntimeError(
+                    "TURNSTILE solver browser_type=cloak but no real CloakBrowser executable found; "
+                    "set CLOAK_BROWSER_PATH or TURNSTILE_CLOAK_BROWSER_PATH, or set TURNSTILE_CLOAK_STRICT=0 to allow fallback."
+                )
+            logger.info(f"Launching CloakBrowser mode executable={executable or 'bundled chromium fallback'}")
+            ignore_default_args = ["--enable-automation", "--enable-unsafe-swiftshader"]
+            try:
+                from cloakbrowser.config import IGNORE_DEFAULT_ARGS  # type: ignore
+                ignore_default_args = IGNORE_DEFAULT_ARGS
+            except Exception:
+                pass
+            launch_proxy = os.getenv("TURNSTILE_SOLVER_PROXY", "") or os.getenv("WARP_PROXY_URL", "") or os.getenv("SOCKS5_PROXY", "")
+            return await self.playwright.chromium.launch(
+                executable_path=executable,
+                headless=self.headless,
+                args=self._build_browser_args(config, launch_proxy=launch_proxy),
+                ignore_default_args=ignore_default_args,
+            )
         if self.browser_type == "camoufox" and self.camoufox:
             return await self.camoufox.start()
         raise RuntimeError(f"Unsupported or uninitialized browser type: {self.browser_type}")
+
+    def _cloak_strict_enabled(self) -> bool:
+        value = os.getenv("TURNSTILE_CLOAK_STRICT", os.getenv("CLOAK_BROWSER_STRICT", "1"))
+        return str(value or "").strip().lower() not in ("0", "false", "no", "off")
+
+    def _cloak_browser_executable_path(self) -> Optional[str]:
+        explicit_candidates = [
+            os.getenv("TURNSTILE_CLOAK_BROWSER_PATH", ""),
+            os.getenv("CLOAK_BROWSER_PATH", ""),
+            os.getenv("CLOAK_BROWSER_EXECUTABLE", ""),
+        ]
+        for candidate in explicit_candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+
+        try:
+            from cloakbrowser import ensure_binary  # type: ignore
+            cloak_path = ensure_binary()
+            if cloak_path and Path(cloak_path).exists():
+                return str(cloak_path)
+        except Exception as e:
+            logger.warning(f"CloakBrowser ensure_binary unavailable: {e}")
+
+        fallback_candidates = [
+            os.getenv("CHROME_PATH", ""),
+            "/ms-playwright/chromium-1223/chrome-linux64/chrome",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+        ]
+        if self._cloak_strict_enabled():
+            return None
+        for candidate in fallback_candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
 
     async def _add_browser_to_pool_locked(self):
         index = self.next_browser_index
         self.next_browser_index += 1
         config = self._build_browser_config()
+        before_roots = self._chrome_root_processes()
         browser = await self._launch_browser(config)
+        # Give the launched browser root process a brief moment to appear in ps.
+        await asyncio.sleep(0.05)
+        after_roots = self._chrome_root_processes()
+        new_pids = set(after_roots.keys()) - set(before_roots.keys())
+        if not new_pids:
+            tracked = set().union(*self.browser_root_pids.values()) if self.browser_root_pids else set()
+            new_pids = set(after_roots.keys()) - tracked
+        root_args = [after_roots.get(pid, "") for pid in new_pids]
+        self.browser_root_pids[index] = set(new_pids)
+        self.browser_profile_dirs[index] = self._profile_dirs_from_args(root_args)
         self.browser_slots[index] = (browser, config)
+        self.browser_use_counts[index] = 0
         await self.browser_pool.put((index, browser, config))
         if self.debug:
-            logger.info(f"Browser {index} initialized successfully with {config['browser_name']} {config['browser_version']}")
+            logger.info(
+                f"Browser {index} initialized successfully with {config['browser_name']} {config['browser_version']} "
+                f"pids={sorted(new_pids)} profiles={sorted(self.browser_profile_dirs[index])}"
+            )
+
+    async def _ensure_browser_pool_target_locked(self):
+        added = 0
+        while len(self.browser_slots) < self.thread_count:
+            await self._add_browser_to_pool_locked()
+            added += 1
+        return added
 
     async def _resize_browser_pool(self, target: int):
         if target < 1:
@@ -312,13 +626,14 @@ class TurnstileAPIServer:
 
         async with self.pool_lock:
             self.thread_count = target
-            self.retire_browsers.clear()
+            self.retire_browsers.intersection_update(self.browser_slots.keys())
 
-            while len(self.browser_slots) < target:
+            while len([idx for idx in self.browser_slots.keys() if idx not in self.retire_browsers]) < target:
                 await self._add_browser_to_pool_locked()
                 added += 1
 
-            excess = len(self.browser_slots) - target
+            active_capacity = len([idx for idx in self.browser_slots.keys() if idx not in self.retire_browsers])
+            excess = active_capacity - target
             if excess > 0:
                 idle = []
                 while True:
@@ -334,7 +649,8 @@ class TurnstileAPIServer:
                     index, browser, _ = item
                     close_indexes.add(index)
                     self.browser_slots.pop(index, None)
-                    to_close.append(browser)
+                    self.browser_use_counts.pop(index, None)
+                    to_close.append((index, browser))
                     closed += 1
                     excess -= 1
 
@@ -363,13 +679,82 @@ class TurnstileAPIServer:
                 "markedForRetire": retiring,
             }
 
-        for browser in to_close:
-            try:
-                await browser.close()
-            except Exception as e:
-                logger.warning(f"Error closing retired browser: {str(e)}")
+        for index, browser in to_close:
+            await self._close_browser_safely(browser, index=index, label=f"Browser {index}: resized out")
 
         logger.info(f"Browser pool resized: target={status['target']} total={status['total']} idle={status['idle']} retiring={status['retiring']}")
+        return status
+
+    async def _recycle_browser_pool(self, target: Optional[int] = None, reason: str = ""):
+        """Replace idle browsers immediately and retire in-use browsers.
+
+        `--random` picks UA/Sec-CH-UA when a browser is launched, not for every
+        task/context. Recycling therefore forces the next task to use a freshly
+        launched browser with a new random browser config, while currently
+        running tasks are closed when they eventually return to the pool.
+        """
+        if target is None:
+            target = self.thread_count
+        if target < 1:
+            target = 1
+
+        to_close = []
+        closed = 0
+        marked = 0
+        added = 0
+        generation = 0
+
+        async with self.pool_lock:
+            self.thread_count = target
+            self.pool_generation += 1
+            generation = self.pool_generation
+
+            idle = []
+            while True:
+                try:
+                    idle.append(self.browser_pool.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            for index, browser, _ in idle:
+                self.browser_slots.pop(index, None)
+                self.browser_use_counts.pop(index, None)
+                self.retire_browsers.discard(index)
+                to_close.append((index, browser))
+                closed += 1
+
+            # Anything left in browser_slots is currently checked out. Mark it
+            # for retirement; it will be closed by _return_browser_to_pool().
+            active_indexes = list(self.browser_slots.keys())
+            for index in active_indexes:
+                if index not in self.retire_browsers:
+                    self.retire_browsers.add(index)
+                    marked += 1
+
+            for _ in range(target):
+                await self._add_browser_to_pool_locked()
+                added += 1
+
+            status = {
+                "target": self.thread_count,
+                "total": len(self.browser_slots),
+                "idle": self.browser_pool.qsize(),
+                "inUse": max(0, len(self.browser_slots) - self.browser_pool.qsize()),
+                "retiring": len(self.retire_browsers),
+                "added": added,
+                "closed": closed,
+                "markedForRetire": marked,
+                "generation": generation,
+            }
+
+        for index, browser in to_close:
+            await self._close_browser_safely(browser, index=index, label=f"Browser {index}: recycled out")
+
+        logger.info(
+            f"Browser pool recycled: target={status['target']} total={status['total']} "
+            f"idle={status['idle']} retiring={status['retiring']} generation={generation} "
+            f"reason={reason[:160]}"
+        )
         return status
 
     async def _periodic_cleanup(self):
@@ -380,6 +765,7 @@ class TurnstileAPIServer:
                 deleted_count = await cleanup_old_results(days_old=7)
                 if deleted_count > 0:
                     logger.info(f"Cleaned up {deleted_count} old results")
+                await asyncio.to_thread(self._cleanup_stale_temp_artifacts_sync, "periodic")
             except Exception as e:
                 logger.error(f"Error during periodic cleanup: {e}")
 
@@ -548,27 +934,40 @@ class TurnstileAPIServer:
 
         return {"server": proxy}
 
+    def _proxy_launch_arg(self, proxy: str) -> list[str]:
+        proxy = str(proxy or "").strip()
+        return [f"--proxy-server={proxy}"] if proxy else []
+
+    def _cloak_proxy_launch_arg_enabled(self) -> bool:
+        value = os.getenv("TURNSTILE_CLOAK_PROXY_LAUNCH_ARG", os.getenv("CLOAK_PROXY_LAUNCH_ARG", "1"))
+        return str(value or "").strip().lower() not in ("0", "false", "no", "off")
+
     async def _new_browser_context(self, browser, browser_config, index: int, proxy_url: Optional[str] = None, viewport: Optional[dict] = None):
         headers = {"Accept-Language": "en-US,en;q=0.9"}
-        if browser_config.get("sec_ch_ua"):
+        native_cloak_ua = self.browser_type in ("cloak", "cloakbrowser") and os.getenv("TURNSTILE_CLOAK_NATIVE_UA", "1").strip().lower() not in ("0", "false", "no", "off")
+        if browser_config.get("sec_ch_ua") and not native_cloak_ua:
             headers["sec-ch-ua"] = browser_config["sec_ch_ua"]
+            headers["sec-ch-ua-mobile"] = "?0"
             headers["sec-ch-ua-platform"] = '"Windows"'
 
         context_options = {
             "locale": "en-US",
+            "timezone_id": os.getenv("BILLING_TIMEZONE_ID", "Europe/Berlin"),
             "extra_http_headers": headers,
         }
-        if browser_config.get("useragent"):
+        if browser_config.get("useragent") and not native_cloak_ua:
             context_options["user_agent"] = browser_config["useragent"]
         if viewport:
             context_options["viewport"] = viewport
 
         proxy = self._select_proxy(proxy_url, index)
-        if proxy:
+        if proxy and not (self.browser_type in ("cloak", "cloakbrowser") and self._cloak_proxy_launch_arg_enabled()):
             context_options["proxy"] = self._proxy_context_option(proxy)
             if self.debug:
                 proxy_server = context_options["proxy"].get("server", proxy)
                 logger.debug(f"Browser {index}: Creating context with proxy {proxy_server}")
+        elif proxy and self.debug:
+            logger.debug(f"Browser {index}: Proxy handled at Cloak launch level: {proxy}")
         elif self.debug:
             logger.debug(f"Browser {index}: Creating context without proxy")
 
@@ -648,22 +1047,23 @@ class TurnstileAPIServer:
                 window.__vapiStripeCardNumber = cardNumber;
                 window.__vapiStripeCardExpiry = cardExpiry;
                 window.__vapiStripeCardCvc = cardCvc;
-                const ready = Promise.all([
-                    new Promise((resolve) => cardNumber.on('ready', resolve)),
-                    new Promise((resolve) => cardExpiry.on('ready', resolve)),
-                    new Promise((resolve) => cardCvc.on('ready', resolve)),
+                const state = { cardNumber: false, cardExpiry: false, cardCvc: false };
+                window.__vapiStripeReadyState = state;
+                window.__vapiStripeReady = Promise.all([
+                    new Promise((resolve) => cardNumber.on('ready', () => { state.cardNumber = true; resolve(true); })),
+                    new Promise((resolve) => cardExpiry.on('ready', () => { state.cardExpiry = true; resolve(true); })),
+                    new Promise((resolve) => cardCvc.on('ready', () => { state.cardCvc = true; resolve(true); })),
                 ]).then(() => true);
-                const timeout = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Stripe Elements not ready after 45000ms')), 45000);
-                });
-                window.__vapiStripeReady = Promise.race([ready, timeout]);
                 cardNumber.mount('#card-number');
                 cardExpiry.mount('#card-expiry');
                 cardCvc.mount('#card-cvc');
             }""",
             publishable_key,
         )
-        await page.evaluate("() => window.__vapiStripeReady")
+        # Stripe ready 事件偶发不触发；真实 iframe input 可见即可继续填卡。
+        await self._find_stripe_input_frame(page, "cardnumber")
+        await self._find_stripe_input_frame(page, "exp-date")
+        await self._find_stripe_input_frame(page, "cvc")
 
     async def _return_browser_to_pool(self, index: int, browser, browser_config):
         try:
@@ -673,29 +1073,54 @@ class TurnstileAPIServer:
 
             if connected:
                 close_browser = False
+                recycle_by_usage = False
+                use_count = 0
+                added = 0
                 async with self.pool_lock:
                     if index in self.retire_browsers:
                         self.retire_browsers.discard(index)
                         self.browser_slots.pop(index, None)
+                        self.browser_use_counts.pop(index, None)
                         close_browser = True
+                        added = await self._ensure_browser_pool_target_locked()
                     else:
-                        await self.browser_pool.put((index, browser, browser_config))
+                        use_count = self.browser_use_counts.get(index, 0) + 1
+                        self.browser_use_counts[index] = use_count
+                        if self.max_tasks_per_browser > 0 and use_count >= self.max_tasks_per_browser:
+                            self.browser_slots.pop(index, None)
+                            self.browser_use_counts.pop(index, None)
+                            close_browser = True
+                            recycle_by_usage = True
+                            self.pool_generation += 1
+                            added = await self._ensure_browser_pool_target_locked()
+                        else:
+                            await self.browser_pool.put((index, browser, browser_config))
 
                 if close_browser:
-                    try:
-                        await browser.close()
-                    except Exception as e:
-                        logger.warning(f"Browser {index}: Error closing retired browser: {str(e)}")
-                    if self.debug:
+                    await self._close_browser_safely(browser, index=index, label=f"Browser {index}: retired")
+                    if recycle_by_usage:
+                        logger.info(
+                            f"Browser {index}: recycled after {use_count}/{self.max_tasks_per_browser} tasks; "
+                            f"added={added} generation={self.pool_generation}"
+                        )
+                    elif self.debug:
                         logger.debug(f"Browser {index}: Browser retired after task")
                 elif self.debug:
-                    logger.debug(f"Browser {index}: Browser returned to pool")
+                    logger.debug(f"Browser {index}: Browser returned to pool use={use_count}/{self.max_tasks_per_browser or 'disabled'}")
             else:
+                added = 0
                 async with self.pool_lock:
                     self.browser_slots.pop(index, None)
+                    self.browser_use_counts.pop(index, None)
                     self.retire_browsers.discard(index)
+                    added = await self._ensure_browser_pool_target_locked()
+                await self._cleanup_await(
+                    asyncio.to_thread(self._kill_tracked_browser_processes_sync, index, f"Browser {index}: disconnected"),
+                    f"Browser {index}: disconnected process cleanup",
+                    timeout=8.0,
+                )
                 if self.debug:
-                    logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+                    logger.warning(f"Browser {index}: Browser disconnected, replaced={added}")
         except Exception as e:
             if self.debug:
                 logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
@@ -771,7 +1196,9 @@ class TurnstileAPIServer:
             if hasattr(browser, "is_connected") and not browser.is_connected():
                 async with self.pool_lock:
                     self.browser_slots.pop(index, None)
+                    self.browser_use_counts.pop(index, None)
                     self.retire_browsers.discard(index)
+                    await self._ensure_browser_pool_target_locked()
                 await save_result(task_id, "stripe_payment_method", {
                     "value": "STRIPE_FAIL",
                     "elapsed_time": 0,
@@ -884,13 +1311,7 @@ class TurnstileAPIServer:
             })
             logger.error(f"Browser {index}: Stripe PaymentMethod task failed: {str(e)}")
         finally:
-            if context:
-                try:
-                    await context.close()
-                except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error closing Stripe context: {str(e)}")
-            await self._return_browser_to_pool(index, browser, browser_config)
+            await self._finish_browser_task(index, browser, browser_config, context, f"Browser {index}: Stripe")
 
     async def _find_turnstile_elements(self, page, index: int):
         """Умная проверка всех возможных Turnstile элементов"""
@@ -1287,172 +1708,47 @@ class TurnstileAPIServer:
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None, proxy_url: Optional[str] = None):
         """Solve the Turnstile challenge."""
-        proxy = None
-
         index, browser, browser_config = await self.browser_pool.get()
-        
+        context = None
+        start_time = time.time()
+
         try:
             if hasattr(browser, 'is_connected') and not browser.is_connected():
                 if self.debug:
                     logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                async with self.pool_lock:
-                    self.browser_slots.pop(index, None)
-                    self.retire_browsers.discard(index)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
-        except Exception as e:
-            if self.debug:
-                logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
-        if self.proxy_support or proxy_url:
-            if proxy_url:
-                proxy = proxy_url
-                if self.debug:
-                    logger.debug(f"Browser {index}: Selected request proxy: {proxy}")
-            else:
-                proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
+            proxy = self._select_proxy(proxy_url, index)
+            context = await self._new_browser_context(
+                browser,
+                browser_config,
+                index,
+                proxy_url=proxy,
+                viewport={"width": 500, "height": 240},
+            )
+            page = await context.new_page()
+            self._attach_page_debug_handlers(page, index)
+            await self._antishadow_inject(page)
+            await self._block_rendering(page)
+            await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
 
-                try:
-                    with open(proxy_file_path) as proxy_file:
-                        proxies = [line.strip() for line in proxy_file if line.strip()]
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+            };
+            """)
 
-                    proxy = random.choice(proxies) if proxies else None
-                    
-                    if self.debug and proxy:
-                        logger.debug(f"Browser {index}: Selected proxy: {proxy}")
-                    elif self.debug and not proxy:
-                        logger.debug(f"Browser {index}: No proxies available")
-                        
-                except FileNotFoundError:
-                    logger.warning(f"Proxy file not found: {proxy_file_path}")
-                    proxy = None
-                except Exception as e:
-                    logger.error(f"Error reading proxy file: {str(e)}")
-                    proxy = None
-
-            if proxy:
-                if '@' in proxy:
-                    try:
-                        scheme_part, auth_part = proxy.split('://')
-                        auth, address = auth_part.split('@')
-                        username, password = auth.split(':')
-                        ip, port = address.split(':')
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating context with proxy {scheme_part}://{ip}:{port} (auth: {username}:***)")
-                        context_options = {
-                            "proxy": {
-                                "server": f"{scheme_part}://{ip}:{port}",
-                                "username": username,
-                                "password": password
-                            },
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
-                        context = await browser.new_context(**context_options)
-                    except ValueError:
-                        raise ValueError(f"Invalid proxy format: {proxy}")
-                else:
-                    parts = proxy.split(':')
-                    if len(parts) == 5:
-                        proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating context with proxy {proxy_scheme}://{proxy_ip}:{proxy_port} (auth: {proxy_user}:***)")
-                        context_options = {
-                            "proxy": {
-                                "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
-                                "username": proxy_user,
-                                "password": proxy_pass
-                            },
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
-                        context = await browser.new_context(**context_options)
-                    elif len(parts) == 3:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating context with proxy {proxy}")
-                        context_options = {
-                            "proxy": {"server": f"{proxy}"},
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
-                        context = await browser.new_context(**context_options)
-                    else:
-                        raise ValueError(f"Invalid proxy format: {proxy}")
-            else:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-                context_options = {"user_agent": browser_config['useragent']}
-                
-                if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                    context_options['extra_http_headers'] = {
-                        'sec-ch-ua': browser_config['sec_ch_ua']
-                    }
-                
-                context = await browser.new_context(**context_options)
-        else:
-            context_options = {"user_agent": browser_config['useragent']}
-            
-            if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                context_options['extra_http_headers'] = {
-                    'sec-ch-ua': browser_config['sec_ch_ua']
-                }
-            
-            context = await browser.new_context(**context_options)
-
-        page = await context.new_page()
-        self._attach_page_debug_handlers(page, index)
-        
-        await self._antishadow_inject(page)
-        
-        await self._block_rendering(page)
-        
-        await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined,
-        });
-        
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-        };
-        """)
-        
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            await page.set_viewport_size({"width": 500, "height": 240})
-            if self.debug:
-                logger.debug(f"Browser {index}: Set viewport size to 500x240")
-
-        start_time = time.time()
-
-        try:
             if self.debug:
                 logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
-
-            if self.debug:
                 logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             await self._capture_page_debug(page, index, task_id, "after-goto")
-
-            # 不再调用 _unblock_rendering —— 保持资源拦截，
-            # Cloudflare 域名和 script/xhr/fetch 已在白名单中，turnstile 不受影响
 
             if self.debug:
                 logger.debug(f"Browser {index}: Waiting for page-owned invisible Turnstile widget")
@@ -1479,7 +1775,6 @@ class TurnstileAPIServer:
                         })
                         return
 
-                    # Безопасная проверка количества элементов с токеном
                     try:
                         count = await locator.count()
                     except Exception as e:
@@ -1491,7 +1786,6 @@ class TurnstileAPIServer:
                         if self.debug and attempt % 5 == 0:
                             logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
                     elif count == 1:
-                        # Если только один элемент, проверяем его токен
                         try:
                             token = await locator.input_value(timeout=500)
                             if token:
@@ -1507,10 +1801,8 @@ class TurnstileAPIServer:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
                     else:
-                        # Если несколько элементов, проверяем все по очереди
                         if self.debug:
                             logger.debug(f"Browser {index}: Found {count} token elements, checking all")
-
                         for i in range(count):
                             try:
                                 element_token = await locator.nth(i).input_value(timeout=500)
@@ -1539,7 +1831,6 @@ class TurnstileAPIServer:
                         elif not click_success and self.debug:
                             logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                    # Адаптивное ожидание
                     wait_time = min(0.5 + (attempt * 0.05), 2.0)
                     await asyncio.sleep(wait_time)
 
@@ -1550,71 +1841,35 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
                     continue
-            
+
             elapsed_time = round(time.time() - start_time, 3)
-            await self._capture_page_debug(page, index, task_id, "failed")
+            if context:
+                await self._capture_page_debug(page, index, task_id, "failed")
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
             if self.debug:
                 logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
             try:
-                await self._capture_page_debug(page, index, task_id, "exception")
+                if "page" in locals():
+                    await self._capture_page_debug(page, index, task_id, "exception")
             except Exception:
                 pass
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
+            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)[:500]})
             if self.debug:
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
         finally:
             if self.debug:
                 logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-            
-            try:
-                await context.close()
-                if self.debug:
-                    logger.debug(f"Browser {index}: Context closed successfully")
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-            
-            try:
-                if hasattr(browser, 'is_connected') and browser.is_connected():
-                    close_browser = False
-                    async with self.pool_lock:
-                        if index in self.retire_browsers:
-                            self.retire_browsers.discard(index)
-                            self.browser_slots.pop(index, None)
-                            close_browser = True
-                        else:
-                            await self.browser_pool.put((index, browser, browser_config))
-
-                    if close_browser:
-                        try:
-                            await browser.close()
-                        except Exception as e:
-                            logger.warning(f"Browser {index}: Error closing retired browser: {str(e)}")
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Browser retired after task")
-                    elif self.debug:
-                        logger.debug(f"Browser {index}: Browser returned to pool")
-                else:
-                    async with self.pool_lock:
-                        self.browser_slots.pop(index, None)
-                        self.retire_browsers.discard(index)
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
+            await self._finish_browser_task(index, browser, browser_config, context, f"Browser {index}: Turnstile")
 
     async def _solve_turnstile_guarded(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None, proxy_url: Optional[str] = None):
         timeout = float(os.getenv("TURNSTILE_SOLVER_TASK_TIMEOUT", "90"))
+        task = asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata, proxy_url=proxy_url))
         try:
-            await asyncio.wait_for(
-                self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata, proxy_url=proxy_url),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
+            task.cancel()
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": timeout, "error": "task timeout"})
             logger.error(f"Task {task_id}: Turnstile solve timed out after {timeout}s")
         except Exception as e:
@@ -1623,18 +1878,17 @@ class TurnstileAPIServer:
 
     async def _solve_stripe_payment_method_guarded(self, task_id: str, card: dict, email: str, publishable_key: str, proxy_url: Optional[str] = None):
         timeout = float(os.getenv("STRIPE_SOLVER_TASK_TIMEOUT", os.getenv("TURNSTILE_SOLVER_TASK_TIMEOUT", "90")))
+        task = asyncio.create_task(self._solve_stripe_payment_method(
+            task_id=task_id,
+            card=card,
+            email=email,
+            publishable_key=publishable_key,
+            proxy_url=proxy_url,
+        ))
         try:
-            await asyncio.wait_for(
-                self._solve_stripe_payment_method(
-                    task_id=task_id,
-                    card=card,
-                    email=email,
-                    publishable_key=publishable_key,
-                    proxy_url=proxy_url,
-                ),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
+            task.cancel()
             await save_result(task_id, "stripe_payment_method", {
                 "value": "STRIPE_FAIL",
                 "elapsed_time": timeout,
@@ -1740,6 +1994,7 @@ class TurnstileAPIServer:
             if hasattr(browser, "is_connected") and not browser.is_connected():
                 async with self.pool_lock:
                     self.browser_slots.pop(index, None)
+                    self.browser_use_counts.pop(index, None)
                     self.retire_browsers.discard(index)
                 await save_result(task_id, "vapi_signup", {
                     "value": "VAPI_SIGNUP_FAIL",
@@ -1844,12 +2099,17 @@ class TurnstileAPIServer:
 
             elapsed_time = round(time.time() - start_time, 3)
             if isinstance(result, dict) and result.get("ok"):
+                try:
+                    storage_state = await context.storage_state() if context else None
+                except Exception:
+                    storage_state = None
                 await save_result(task_id, "vapi_signup", {
                     "signup_ok": True,
                     "value": "VAPI_SIGNUP_OK",
                     "status_code": result.get("status"),
                     "elapsed_time": elapsed_time,
                     "device_fingerprint_token": fingerprint_token,
+                    "browser_storage_state": storage_state,
                     "csrf_length": result.get("csrfLength", 0),
                     "fingerprint_length": result.get("fingerprintLength", 0),
                     **self._browser_fingerprint_result(browser_config),
@@ -1886,13 +2146,7 @@ class TurnstileAPIServer:
             })
             logger.error(f"Browser {index}: Vapi signup task failed: {str(e)}")
         finally:
-            if context:
-                try:
-                    await context.close()
-                except Exception as e:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Error closing Vapi signup context: {str(e)}")
-            await self._return_browser_to_pool(index, browser, browser_config)
+            await self._finish_browser_task(index, browser, browser_config, context, f"Browser {index}: Vapi signup")
 
     async def _solve_vapi_signup_guarded(
         self,
@@ -1908,23 +2162,22 @@ class TurnstileAPIServer:
         verification_id: str = "",
     ):
         timeout = float(os.getenv("VAPI_SIGNUP_SOLVER_TASK_TIMEOUT", os.getenv("TURNSTILE_SOLVER_TASK_TIMEOUT", "90")))
+        task = asyncio.create_task(self._solve_vapi_signup(
+            task_id=task_id,
+            email=email,
+            password=password,
+            sitekey=sitekey,
+            dashboard_version=dashboard_version,
+            proxy_url=proxy_url,
+            page_url=page_url,
+            api_url=api_url,
+            session_id=session_id,
+            verification_id=verification_id,
+        ))
         try:
-            await asyncio.wait_for(
-                self._solve_vapi_signup(
-                    task_id=task_id,
-                    email=email,
-                    password=password,
-                    sitekey=sitekey,
-                    dashboard_version=dashboard_version,
-                    proxy_url=proxy_url,
-                    page_url=page_url,
-                    api_url=api_url,
-                    session_id=session_id,
-                    verification_id=verification_id,
-                ),
-                timeout=timeout,
-            )
+            await asyncio.wait_for(task, timeout=timeout)
         except asyncio.TimeoutError:
+            task.cancel()
             await save_result(task_id, "vapi_signup", {
                 "value": "VAPI_SIGNUP_FAIL",
                 "elapsed_time": timeout,
@@ -2149,6 +2402,12 @@ class TurnstileAPIServer:
                 "idle": self.browser_pool.qsize(),
                 "inUse": max(0, len(self.browser_slots) - self.browser_pool.qsize()),
                 "retiring": len(self.retire_browsers),
+                "generation": self.pool_generation,
+                "maxTasksPerBrowser": self.max_tasks_per_browser,
+                "browserUses": {str(index): count for index, count in self.browser_use_counts.items()},
+                "browserPids": {str(index): sorted(pids) for index, pids in self.browser_root_pids.items()},
+                "browserProfiles": {str(index): sorted(paths) for index, paths in self.browser_profile_dirs.items()},
+                "closeTimeout": self.close_timeout,
             }), 200
 
     async def resize_pool_route(self):
@@ -2169,6 +2428,30 @@ class TurnstileAPIServer:
             }), 400
 
         status = await self._resize_browser_pool(target)
+        return jsonify({"ok": True, **status}), 200
+
+    async def recycle_pool_route(self):
+        raw_threads = request.args.get('threads') or request.args.get('thread') or ""
+        reason = request.args.get('reason') or ""
+        if request.method == "POST":
+            try:
+                body = await request.get_json(silent=True) or {}
+                raw_threads = raw_threads or str(body.get("threads") or body.get("thread") or "")
+                reason = reason or str(body.get("reason") or "")
+            except Exception:
+                pass
+
+        target = None
+        if raw_threads:
+            try:
+                target = int(raw_threads)
+            except Exception:
+                return jsonify({
+                    "ok": False,
+                    "error": "threads must be a positive integer",
+                }), 400
+
+        status = await self._recycle_browser_pool(target=target, reason=reason)
         return jsonify({"ok": True, **status}), 200
 
     async def get_result(self):
@@ -2216,6 +2499,7 @@ class TurnstileAPIServer:
                     "statusCode": result.get("status_code", 0),
                     "elapsedTime": result.get("elapsed_time", 0),
                     "deviceFingerprintToken": result.get("device_fingerprint_token", ""),
+                    "browserStorageState": result.get("browser_storage_state") or None,
                     "csrfLength": result.get("csrf_length", 0),
                     "fingerprintLength": result.get("fingerprint_length", 0),
                     "userAgent": result.get("user_agent", ""),
@@ -2331,7 +2615,7 @@ def parse_args():
     parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode). By default, headless mode is enabled.')
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
-    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
+    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, cloak, camoufox (default: chromium)')
     parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
@@ -2353,6 +2637,8 @@ if __name__ == '__main__':
         'chromium',
         'chrome',
         'msedge',
+        'cloak',
+        'cloakbrowser',
         'camoufox',
     ]
     if args.browser_type not in browser_types:

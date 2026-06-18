@@ -12,8 +12,12 @@ def get_proxy_list(direct_proxy: str = "") -> list[str]:
     """
     获取代理列表。
     - direct_proxy 不为空时直接返回单个代理（如 socks5://127.0.0.1:10808）
+    - direct_proxy=direct/none/0 时显式全程直连，避免去拉 easy_proxies
     - 否则从 easy_proxies 拉取
     """
+    direct_proxy = str(direct_proxy or "").strip()
+    if direct_proxy.lower() in ("direct", "direct://", "none", "no", "off", "0"):
+        return [""]
     if direct_proxy:
         return [direct_proxy]
 

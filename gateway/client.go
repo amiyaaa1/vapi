@@ -21,9 +21,12 @@ import (
 const vapiURL = "https://api.vapi.ai/chat/responses"
 
 type VapiClient struct {
-	helper      string
-	socks5Addr  string
-	impersonate string
+	helper         string
+	helperURL      string
+	helperFallback bool
+	helperHTTP     *http.Client
+	socks5Addr     string
+	impersonate    string
 }
 
 type curlCFFIRequest struct {
@@ -49,8 +52,22 @@ type curlCFFIResponseBody struct {
 }
 
 func NewVapiClient(socks5Addr string) *VapiClient {
+	helperURL := strings.TrimSpace(os.Getenv("VAPI_CHAT_HELPER_URL"))
+	if helperURL == "" {
+		helperURL = fmt.Sprintf("http://%s:%s/chat", envOr("VAPI_CHAT_HELPER_HOST", "127.0.0.1"), envOr("VAPI_CHAT_HELPER_PORT", "8099"))
+	}
+	if !envBool("VAPI_CHAT_HELPER_DAEMON_ENABLED", true) {
+		helperURL = ""
+	}
 	return &VapiClient{
-		helper:      envOr("VAPI_CHAT_HELPER", defaultChatHelper()),
+		helper:         envOr("VAPI_CHAT_HELPER", defaultChatHelper()),
+		helperURL:      helperURL,
+		helperFallback: envBool("VAPI_CHAT_HELPER_FALLBACK", true),
+		helperHTTP: &http.Client{Transport: &http.Transport{
+			MaxIdleConns:        1024,
+			MaxIdleConnsPerHost: 1024,
+			IdleConnTimeout:     90 * time.Second,
+		}},
 		socks5Addr:  socks5Addr,
 		impersonate: envOr("CURL_CFFI_IMPERSONATE", "chrome131"),
 	}
@@ -96,6 +113,42 @@ func (c *VapiClient) do(ctx context.Context, apiKey string, payload *VapiRequest
 }
 
 func (c *VapiClient) curlCFFI(ctx context.Context, request curlCFFIRequest) (*http.Response, error) {
+	if c.helperURL != "" {
+		resp, err := c.curlCFFIDaemon(ctx, request)
+		if err == nil {
+			return resp, nil
+		}
+		if !c.helperFallback {
+			return nil, err
+		}
+	}
+	return c.curlCFFIProcess(ctx, request)
+}
+
+func (c *VapiClient) curlCFFIDaemon(ctx context.Context, request curlCFFIRequest) (*http.Response, error) {
+	requestBody, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.helperURL, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.helperHTTP.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("curl_cffi daemon %s: %w", c.helperURL, err)
+	}
+	if resp.Header.Get("X-Vapi-Helper-Error") != "" {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, fmt.Errorf("curl_cffi daemon %s returned %d: %s", c.helperURL, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return resp, nil
+}
+
+func (c *VapiClient) curlCFFIProcess(ctx context.Context, request curlCFFIRequest) (*http.Response, error) {
 	helper := resolveChatHelperPath(c.helper)
 	name := helper
 	cmdArgs := []string{}

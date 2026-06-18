@@ -85,7 +85,12 @@ func AdminPageHandler(pool *KeyPool, configStore *ConfigStore, topup *TopupManag
             <label><div class="label">卡号</div><input name="billingCardNumber" autocomplete="off"></label>
             <label><div class="label">有效期</div><input name="billingCardExpiry" autocomplete="off" placeholder="MM / YY"></label>
             <label><div class="label">CVC</div><input name="billingCardCvc" autocomplete="off"></label>
+            <label><div class="label">自动生成卡</div><select name="billingCardGeneratorEnabled"><option value="false">关闭</option><option value="true">开启</option></select></label>
+            <label><div class="label">生成卡头</div><input name="billingCardGeneratorPrefixes" placeholder="默认 415464，可填多个逗号分隔"></label>
+            <label><div class="label">有效期最小月数</div><input type="number" min="1" max="120" name="billingCardGeneratorMinMonths" placeholder="18"></label>
+            <label><div class="label">有效期最大月数</div><input type="number" min="1" max="120" name="billingCardGeneratorMaxMonths" placeholder="60"></label>
           </div>
+          <label><div class="label" style="margin-top:12px">备用卡池（每行 number|MM/YY|cvc）</div><textarea name="billingCardPool" placeholder="5450...|07/30|321"></textarea></label>
           <label><div class="label" style="margin-top:12px">补号命令</div><textarea name="autoTopupCommand"></textarea></label>
           <div class="row"><button type="submit">保存配置</button><span id="configMsg" class="muted"></span></div>
         </form>
@@ -156,6 +161,11 @@ func AdminPageHandler(pool *KeyPool, configStore *ConfigStore, topup *TopupManag
       setConfigField(form, 'billingCardNumber', config.billingCardNumber || '');
       setConfigField(form, 'billingCardExpiry', config.billingCardExpiry || '');
       setConfigField(form, 'billingCardCvc', config.billingCardCvc || '');
+      setConfigField(form, 'billingCardGeneratorEnabled', String(config.billingCardGeneratorEnabled || false));
+      setConfigField(form, 'billingCardGeneratorPrefixes', config.billingCardGeneratorPrefixes || '');
+      setConfigField(form, 'billingCardGeneratorMinMonths', config.billingCardGeneratorMinMonths || 18);
+      setConfigField(form, 'billingCardGeneratorMaxMonths', config.billingCardGeneratorMaxMonths || 60);
+      setConfigField(form, 'billingCardPool', config.billingCardPool || '');
 	      setConfigField(form, 'autoTopupCommand', config.autoTopupCommand || '');
 	    }
 	    function formatDuration(ms) {
@@ -247,6 +257,16 @@ func AdminPageHandler(pool *KeyPool, configStore *ConfigStore, topup *TopupManag
       const values = Object.fromEntries(new FormData(configForm).entries());
       values.autoTopupEnabled = values.autoTopupEnabled === 'true';
       values.requireChatReadyAfterSignup = values.requireChatReadyAfterSignup === 'true';
+      values.billingCardGeneratorEnabled = values.billingCardGeneratorEnabled === 'true';
+      values.billingCardGeneratorPrefixes = (values.billingCardGeneratorPrefixes || '').trim() || '415464';
+      values.billingCardAllowedPrefixes = values.billingCardGeneratorEnabled ? values.billingCardGeneratorPrefixes : '415464';
+      values.billingCardGeneratorAllowLive = values.billingCardGeneratorEnabled;
+      values.billingCardGeneratorOnly = values.billingCardGeneratorEnabled;
+      values.billingCardGeneratorUseConfigPrefixes = false;
+      values.billingCardGeneratorCount = values.billingCardGeneratorEnabled ? 20 : 0;
+      values.billingCardGeneratorPrefixDigits = 6;
+      values.billingCardGeneratorMinMonths = Math.max(1, Math.min(120, Number(values.billingCardGeneratorMinMonths || 18)));
+      values.billingCardGeneratorMaxMonths = Math.max(values.billingCardGeneratorMinMonths, Math.min(120, Number(values.billingCardGeneratorMaxMonths || 60)));
       values.minAccounts = Number(values.minAccounts);
       values.topupLowWatermark = Number(values.topupLowWatermark);
       values.topupConcurrency = Number(values.topupConcurrency);
@@ -363,11 +383,13 @@ func LogoutHandler() http.HandlerFunc {
 
 func AdminStateHandler(pool *KeyPool, configStore *ConfigStore, topup *TopupManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := configStore.Load()
 		writeJSON(w, map[string]any{
 			"stats":        pool.Stats(),
-			"config":       configStore.Load(),
+			"config":       cfg,
 			"topup":        topup.Status(),
 			"topupMetrics": topup.Metrics(),
+			"billingCards": topupBillingCardStatuses(cfg),
 		})
 	}
 }

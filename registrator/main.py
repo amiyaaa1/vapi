@@ -9,7 +9,17 @@ from datetime import datetime, timezone
 from . import config
 from .email_client import MoeMailClient
 from .proxy import get_proxy_list, pick_proxy
-from .register import register_one
+from .register import (
+    register_one,
+    ensure_billing_cards_available_for_mode,
+    wait_billing_attach_risk_cooldown_if_needed,
+    _available_billing_cards_for_mode,
+    _billing_card_tail,
+    _billing_attach_risk_load,
+    _billing_add_card_dashboard_version_override,
+    _stripe_pm_user_agent_override,
+    _billing_dodgeball_refresh_enabled,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,8 +82,56 @@ class SubdomainPool:
         self._domains.clear()
 
 
+def billing_preflight_summary() -> dict:
+    """只读 billing 预检：不创建邮箱、不注册、不触发 Stripe/Vapi。"""
+    configured_cards = config.configured_billing_cards()
+    generator = config.billing_card_generator_summary(configured_cards)
+    available, skipped = _available_billing_cards_for_mode()
+    cards_ok, skipped_cards = ensure_billing_cards_available_for_mode()
+    risk = _billing_attach_risk_load()
+    return {
+        "ok": bool(cards_ok),
+        "availableCount": len(available),
+        "skippedCount": len(skipped),
+        "configuredCount": len(configured_cards),
+        "availableTails": [_billing_card_tail(card) for card in available[:20]],
+        "skippedSample": (skipped or skipped_cards)[:20],
+        "billingCardGenerator": generator,
+        "risk": {
+            "consecutive400": risk.get("consecutive400", 0),
+            "threshold": risk.get("threshold"),
+            "cooldownUntil": risk.get("cooldownUntil", 0),
+            "lastReason": risk.get("lastReason", ""),
+            "lastAt": risk.get("lastAt", ""),
+        },
+        "billingRuntime": {
+            "addCardDashboardVersionOverride": _billing_add_card_dashboard_version_override(),
+            "stripePmUserAgent": _stripe_pm_user_agent_override(),
+            "refreshDodgeballBeforeAddCard": _billing_dodgeball_refresh_enabled("before-add-card"),
+        },
+    }
+
+
+def run_billing_preflight_only() -> int:
+    summary = billing_preflight_summary()
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not summary.get("ok"):
+        return 1
+    return 0
+
+
 async def run(count: int, concurrency: int, proxy: str = "", per_subdomain: int = 5):
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    cards_ok, skipped_cards = ensure_billing_cards_available_for_mode()
+    if not cards_ok:
+        detail = "; ".join(skipped_cards[:3])
+        log.error(
+            "❌ 注册前检查失败: 所有 billing 卡都处于 card_declined 隔离期；"
+            f"{detail}；请更换新卡/配置 billingCardPool，或设置 BILLING_CARD_DECLINE_QUARANTINE_DISABLED=1"
+        )
+        log.info(f"完成: 成功 0, 失败 {count}")
+        return 0, count
 
     log.info("获取代理列表...")
     proxies = get_proxy_list(direct_proxy=proxy)
@@ -91,6 +149,7 @@ async def run(count: int, concurrency: int, proxy: str = "", per_subdomain: int 
 
         async with sem:
             try:
+                await wait_billing_attach_risk_cooldown_if_needed()
                 email_info = await mail.create_email()
                 email_addr = email_info["address"]
                 email_id = email_info["id"]
@@ -138,7 +197,11 @@ def main():
     parser.add_argument("--concurrency", type=int, default=1, help="并发数")
     parser.add_argument("--proxy", default="", help="直接指定代理")
     parser.add_argument("--per-subdomain", type=int, default=5, help="每个子域名复用次数 (默认5)")
+    parser.add_argument("--billing-preflight-only", action="store_true", help="只做 billing 卡/风控预检，不注册、不绑卡")
     args = parser.parse_args()
+
+    if args.billing_preflight_only:
+        sys.exit(run_billing_preflight_only())
 
     success, fail = asyncio.run(run(args.count, args.concurrency, args.proxy, args.per_subdomain))
     if fail > 0:
